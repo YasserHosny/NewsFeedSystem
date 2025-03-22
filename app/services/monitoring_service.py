@@ -84,15 +84,42 @@ class MonitoringService:
 
     def get_available_worker(self):
         """
-        Get an available worker from the stored statuses in MongoDB.
+        Get an available worker and mark it as 'busy' to prevent duplicate assignments.
 
         :return: str, worker ID of an available worker, or None if none are available
         """
         try:
             workers = data_storage_service.get_all_worker_statuses()
             available_workers = [worker["worker_id"] for worker in workers if worker["status"] == "available"]
-            logger.info(f"Available workers: {available_workers}")
-            return available_workers[0] if available_workers else None
+
+            if not available_workers:
+                logger.warning("No available workers found.")
+                return None
+
+            selected_worker = random.choice(available_workers)
+
+            # Update worker status to 'busy'
+            data_storage_service.config_collection.update_one(
+                {"worker_id": selected_worker}, {"$set": {"status": "busy"}}
+            )
+            
+            logger.info(f"Worker {selected_worker} allocated and marked as busy.")
+            return selected_worker
+
         except Exception as e:
             logger.error(f"Error fetching worker statuses: {str(e)}")
             return None
+
+    def release_worker(self, worker_id):
+        """
+        Release a worker by setting its status back to 'available'.
+
+        :param worker_id: str, Worker ID to release
+        """
+        try:
+            data_storage_service.config_collection.update_one(
+                {"worker_id": worker_id}, {"$set": {"status": "available"}}
+            )
+            logger.info(f"Worker {worker_id} released and marked as available.")
+        except Exception as e:
+            logger.error(f"Error releasing worker {worker_id}: {str(e)}")

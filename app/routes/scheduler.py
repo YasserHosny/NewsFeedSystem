@@ -4,7 +4,7 @@ from random import random, choice
 import time
 from app.services.message_queue_service import MessageQueueService
 from app.services.proxy_manager_service import ProxyManagerService
-from app.services.validation_service import validate_frequency, validate_task_fields
+from app.services.validation_service import validate_frequency, validate_task_fields, convert_to_minutes
 
 
 # Initialize logging
@@ -52,23 +52,6 @@ def prioritize_tasks():
     """
     Prioritize tasks in the queue by converting frequency to minutes and sorting in ascending order.
     """
-    def convert_to_minutes(frequency):
-        """
-        Convert frequency to minutes.
-
-        :param frequency: str, frequency in the format '<number> <unit>'
-        :return: int, equivalent frequency in minutes
-        """
-        unit_to_minutes = {"mins": 1, "hours": 60, "days": 1440, "weeks": 10080}  # Conversion factors
-
-        is_valid, error_message = validate_frequency(frequency)
-        if not is_valid:
-            logger.error(f"Invalid frequency: {error_message}")
-            return float('inf')  # Assign lowest priority for invalid frequencies
-
-        value, unit = frequency.split()
-        return int(value) * unit_to_minutes[unit]
-
     try:
         # Sort tasks based on their converted frequency in minutes
         task_queue.sort(key=lambda task: convert_to_minutes(task.get("frequency", "")))

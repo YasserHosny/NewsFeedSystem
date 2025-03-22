@@ -9,6 +9,9 @@ from app.services.alert_service import AlertService
 from app.services.monitoring_service import MonitoringService
 from app.workers.task_worker import TaskWorker
 from app.logging_config import get_logger
+import asyncio
+from threading import Lock
+from datetime import datetime, timedelta
 
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -18,19 +21,17 @@ logger = get_logger('orchestrator')
 orchestrator_bp = Blueprint('orchestrator', __name__)
 
 # Initialize Services
-mq_service = MessageQueueService()
+message_queue_service = MessageQueueService(queue_name="crawl_tasks")
 proxy_manager = ProxyManagerService()
 task_tracker = TaskTrackerService()
 alert_service = AlertService(webhook_url="https://hooks.slack.com/services/your/webhook/url")
 monitoring_service = MonitoringService()
 
 MAX_RETRIES = 3  # Maximum number of task retries
-# Internal store for worker statuses
-worker_status_store = {
-    "worker-1": "available",
-    "worker-2": "busy",
-    "worker-3": "available"
-}
+# In-memory lock (replace with Redis/Mongo for production)
+task_locks = {}
+task_locks_lock = Lock()
+
 def allocate_worker():
     """
     Allocate an available worker dynamically using the MonitoringService.
@@ -56,17 +57,6 @@ def validate_proxy(proxy):
         logger.warning(f"Proxy {proxy} validation failed.")
     return is_valid
 
-def release_worker(worker):
-    """
-    Release a worker back to the available pool.
-
-    :param worker: str, worker ID to release
-    """
-    if worker:
-        logger.info("Worker released: %s", worker)
-    else:
-        logger.warning("Attempted to release a worker that is not allocated.")
-
 def process_task_with_retry(task):
     """
     Process a task with retries, monitoring, and alerting on failure.
@@ -74,41 +64,43 @@ def process_task_with_retry(task):
     :param task: dict, task to process
     """
     retries = task.get("retries", 0)
-
+    logger.info(f"Processing task {task['task_name']} with {retries} retries.")
     try:
         # Allocate a worker and proxy for the task
-        worker = allocate_worker()
-        if not worker:
+        worker_id = allocate_worker()
+        if not worker_id:
             logger.warning("No available workers for task %s. Requeuing task.", task["task_name"])
-            mq_service.publish_task(task)
+            message_queue_service.publish_task(task)
             return
 
         proxy = proxy_manager.get_proxy()
         if not proxy:
             logger.warning("No available proxies for task %s. Requeuing task.", task["task_name"])
-            mq_service.publish_task(task)
-            release_worker(worker)
+            message_queue_service.publish_task(task)
+            monitoring_service.release_worker(worker_id)
             return
 
         # Update task metadata
-        task["allocated_worker"] = worker
+        task["allocated_worker"] = worker_id
         task["allocated_proxy"] = proxy
+        logger.info(f"Task {task['task_name']} allocated to worker {worker_id} with proxy {proxy}")
 
         # Update task status to 'in-progress'
-        task_tracker.update_task_status(task["task_name"], "in-progress")
+        task_tracker.update_task_status(task["task_name"], "in-progress", worker_id, proxy)
 
         # Execute the task
-        logger.info(f"Executing task {task['task_name']} with worker {worker} and proxy {proxy}")
+        logger.info(f"Executing task {task['task_name']} with worker {worker_id} and proxy {proxy}")
+        logger.info(f"worker: {worker_id}, orchestrator_url: {current_app.config['DOMAIN'] + 'orchestrator'}")
         worker_instance = TaskWorker(
-            worker_id=worker.id,
-            orchestrator_url=current_app.config["DOMAIN"] + "/orchestrator"
+            worker_id=worker_id,
+            orchestrator_url=current_app.config["DOMAIN"] + "orchestrator"
         )
-        worker_instance.execute_task(task)
+        asyncio.run(worker_instance.execute_task(task))
 
         # Log success and update task status
         log_task_result(task, "success")
-        task_tracker.update_task_status(task["task_name"], "completed")
-        release_worker(worker)
+        task_tracker.update_task_status(task["task_name"], "completed", worker_id, proxy)
+        monitoring_service.release_worker(worker_id)
 
     except Exception as e:
         retries += 1
@@ -117,12 +109,12 @@ def process_task_with_retry(task):
 
         if retries <= MAX_RETRIES:
             # Retry task
-            task_tracker.update_task_status(task["task_name"], f"retrying ({retries}/{MAX_RETRIES})")
-            mq_service.publish_task(task)
+            task_tracker.update_task_status(task["task_name"], f"retrying ({retries}/{MAX_RETRIES})", worker_id, proxy)
+            message_queue_service.publish_task(task)
         else:
             # Mark task as failed and send alert
             log_task_result(task, "failure", error=str(e))
-            task_tracker.update_task_status(task["task_name"], "failed")
+            task_tracker.update_task_status(task["task_name"], "failed", worker_id, proxy)
             alert_service.send_alert(f"Task {task['task_name']} failed after {MAX_RETRIES} retries.")
 
 def log_task_result(task, status, error=None):
@@ -133,32 +125,51 @@ def log_task_result(task, status, error=None):
     :param status: str, task execution status
     :param error: str, error message if the task failed
     """
-    result = {
-        "task_name": task["task_name"],
-        "status": status,
-        "allocated_worker": task.get("allocated_worker"),
-        "allocated_proxy": task.get("allocated_proxy"),
-        "error": error,
-        "timestamp": time.time()
-    }
-    data_storage_service.save_task_result(result)  # Save result to MongoDB
-    logger.info("Task result logged: %s", result)
+    data_storage_service.save_task_result(task["task_name"], task.get("allocated_worker"), task.get("allocated_proxy"), status, error)  # Save result to MongoDB
 
-@orchestrator_bp.route('/process_tasks', methods=['POST'])
+@orchestrator_bp.route('/process_tasks', methods=['GET'])
 def process_tasks():
     """
-    API to process tasks from the message queue.
+    API to continuously process tasks from the message queue.
+    Implements task locking to prevent duplicate processing.
     """
-    logger.info("Starting task processing...")
-    while True:
-        task = mq_service.get_task()  # Retrieve a task from the message queue
-        if not task:
-            logger.info("No more tasks in the queue.")
-            break
+    logger.info("Starting task processing loop...")
 
-        process_task_with_retry(task)
+    try:
+        while True:
+            task = message_queue_service.get_task()
+            if not task:
+                logger.info("No tasks found. Sleeping for 5 seconds...")
+                time.sleep(5)
+                continue
 
-    return jsonify({"status": "success", "message": "All tasks processed."}), 200
+            task_id = str(task["_id"])
+            now = datetime.utcnow()
+
+            # Acquire lock
+            with task_locks_lock:
+                lock_entry = task_locks.get(task_id)
+                if lock_entry and lock_entry > now:
+                    logger.warning(f"Task {task_id} is already being processed. Skipping.")
+                    continue
+                # Set lock with 2-minute timeout
+                task_locks[task_id] = now + timedelta(minutes=2)
+
+            # Process the task
+            try:
+                process_task_with_retry(task)
+            except Exception as e:
+                logger.exception(f"Unexpected error during processing task {task_id}: {e}")
+            finally:
+                # Clean up lock after execution
+                with task_locks_lock:
+                    if task_id in task_locks:
+                        del task_locks[task_id]
+
+    except KeyboardInterrupt:
+        logger.info("Task processing loop interrupted by user.")
+
+    return jsonify({"status": "stopped", "message": "Task processing stopped."}), 200
 
 @orchestrator_bp.route('/failed_tasks', methods=['GET'])
 def get_failed_tasks():

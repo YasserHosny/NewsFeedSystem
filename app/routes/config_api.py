@@ -63,17 +63,13 @@ def submit_configuration():
         saved_config = data_storage_service.save_config(config)
         logger.info("Configuration saved successfully: %s", saved_config)
 
-        # Step 4: Queue Task in Scheduler
-        scheduler_response = requests.post(current_app.config["DOMAIN"]+"scheduler/schedule_task", json=saved_config)
-        if scheduler_response.status_code != 200:
-            logger.error("Failed to queue task in Scheduler: %s", scheduler_response.text)
-            return jsonify({"status": "error", "message": "Failed to queue task in Scheduler."}), 500
-
+        # Step 4: Inform user that the scheduler will pick it up soon
         return jsonify({
             "status": "success",
-            "message": "Configuration saved and task queued successfully.",
+            "message": "Configuration saved. Task will be picked up by the scheduler shortly.",
             "data": saved_config
         }), 200
+
     except Exception as e:
         logger.error("Failed to process configuration: %s", str(e))
         return jsonify({"status": "error", "message": "Failed to process configuration."}), 500

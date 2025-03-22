@@ -26,6 +26,7 @@ class MessageQueueService:
         :param task: dict, the task to publish
         """
         try:
+            logger.info(f"Publishing task to queue: {task}")
             self.channel.basic_publish(
                 exchange='',
                 routing_key=self.queue_name,

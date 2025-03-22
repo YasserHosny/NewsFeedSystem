@@ -14,6 +14,7 @@ from app.config import Config
 import uuid
 from functools import wraps
 from playwright.async_api import async_playwright
+from datetime import datetime, timezone
 
 # Initialize logger first
 logger = get_logger('worker')
@@ -96,111 +97,107 @@ class TaskWorker:
 
     async def execute_task(self, task):
         """
-        Execute the given task using Playwright for web scraping.
+        Execute the given task using Playwright for web scraping across multiple pages.
         """
         self.logger.info(f"Starting execution for task: {task}")
         retries = task.get("retries", 0)
+        all_items = []
 
         try:
+            self.logger.info("Starting Playwright")
             playwright = await async_playwright().start()
-            browser = await playwright.chromium.launch(
-                headless=True,
-            )
-            
-            # Configure context without timeout
+            self.logger.info("Launching browser")
+            browser = await playwright.chromium.launch(headless=True)
+
+            self.logger.info("Creating new browser context")
             context = await browser.new_context(
                 viewport={'width': 1920, 'height': 1080},
                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             )
-            
-            # Set default timeout for all operations
-            context.set_default_timeout(60000)  # 60 seconds
-            
+
+            context.set_default_timeout(60000)
+            self.logger.info("Opening new page")
             page = await context.new_page()
 
-            try:
-                self.logger.info(f"Navigating to URL: {task['url']} for task: {task['task_name']}")
-                response = await page.goto(
-                    task["url"], 
-                    wait_until='networkidle',
-                    timeout=30000  # 30 second timeout for navigation
-                )
-                
+            crawl_settings = task.get("crawl_settings", {})
+            selectors = crawl_settings.get("selectors", {})
+            content_selector = selectors.get("content")
+            specific_selector = selectors.get("specific")
+            next_page_selector = selectors.get("next")  # Support for pagination
+            
+            current_url = task["url"]
+            page_num = 1
+
+            while current_url:
+                self.logger.info(f"Navigating to page {page_num}: {current_url}")
+                response = await page.goto(current_url, wait_until='domcontentloaded', timeout=60000)
+
                 if not response or response.status >= 400:
                     raise Exception(f"Failed to load page: {response.status if response else 'No response'}")
 
-                # Wait for content to load
-                await page.wait_for_selector('body', timeout=10000)
-                
-                # Get title for metadata
-                title = await page.title()
+                self.logger.info(f"Waiting for content selector: {content_selector}")
+                await page.wait_for_selector(content_selector, timeout=10000)
+                content_elements = page.locator(content_selector)
+                content_count = await content_elements.count()
 
-                # Get selectors from task
-                self.logger.info(f"Task: {task}")
-                crawl_settings = task.get("crawl_settings", {})
-                selectors = crawl_settings.get("selectors", {})
-                crawled_items = []
+                self.logger.info(f"Found {content_count} content blocks on page {page_num}")
 
-                # Crawl content selector first
-                content_selector = selectors.get("content")
-                specific_selector = selectors.get("specific")
-                self.logger.info(f"Found content selector: {content_selector}")
-                self.logger.info(f"Found specific selector: {specific_selector}")
+                for i in range(content_count):
+                    content_element = content_elements.nth(i)
+                    specific_elements = content_element.locator(specific_selector)
+                    specific_count = await specific_elements.count()
 
-                if content_selector and specific_selector:
-                    self.logger.info(f"Using content selector: {content_selector}")
-                    self.logger.info(f"Using specific selector: {specific_selector}")
+                    for j in range(specific_count):
+                        text = await specific_elements.nth(j).inner_text()
+                        all_items.append({
+                            "page": page_num,
+                            "content_index": i,
+                            "specific_index": j,
+                            "content": text.strip()
+                        })
 
-                    # Wait for content elements to appear
-                    await page.wait_for_selector(content_selector, timeout=10000)
-
-                    content_elements = page.locator(content_selector)
-                    content_count = await content_elements.count()
-                    self.logger.info(f"Found {content_count} content elements")
-
-                    for i in range(content_count):
-                        content_element = content_elements.nth(i)
-                        specific_elements = content_element.locator(specific_selector)
-                        specific_count = await specific_elements.count()
-                        self.logger.info(f"Found {specific_count} specific elements in content element {i}")
-
-                        for j in range(specific_count):
-                            specific_element = specific_elements.nth(j)
-                            text = await specific_element.inner_text()
-                            crawled_items.append({
-                                "content_index": i,
-                                "specific_index": j,
-                                "content": text.strip()
-                            })
-                else:
-                    self.logger.warning("Selectors not properly defined in task.")
-
-                # Take screenshot
-                screenshot_path = f"{self.screenshot_dir}{task['task_name']}_{int(time.time())}.png"
+                # Take screenshot of this page
+                screenshot_path = f"{self.screenshot_dir}{task['task_name']}_page{page_num}_{int(time.time())}.png"
+                self.logger.info(f"Taking screenshot: {screenshot_path}")
                 await page.screenshot(path=screenshot_path)
-                self.logger.info(f"Screenshot saved at: {screenshot_path}")
+                self.logger.info(f"Screenshot for page {page_num} saved: {screenshot_path}")
 
-                # Prepare result with all crawled items
-                result = {
-                    "task_name": task["task_name"],
-                    "url": task["url"],
-                    "status": "success",
-                    "title": title,
-                    "crawled_items": crawled_items,
-                    "screenshot_path": screenshot_path,
-                    "timestamp": time.time(),
-                }
-                
-                data_storage_service.save_crawl_items(result)
-                self.logger.info(f"Task completed successfully and {len(crawled_items)} items saved for task: {task['task_name']}")
+                # Go to next page if available
+                if next_page_selector:
+                    next_button = page.locator(next_page_selector)
+                    if await next_button.count() > 0 and await next_button.is_enabled():
+                        self.logger.info("Clicking next page button")
+                        await next_button.click()
+                        await page.wait_for_timeout(2000)  # Add delay between pages
+                        current_url = page.url
+                        page_num += 1
+                    else:
+                        self.logger.info("No next page found. Finishing.")
+                        break
+                else:
+                    self.logger.info("No next page selector provided. Finishing.")
+                    break
 
-            except Exception as e:
-                self.logger.error(f"Page navigation failed: {str(e)}")
-                raise
-            finally:
-                await context.close()
-                await browser.close()
-                await playwright.stop()
+            # Final Result
+            title = await page.title()
+            result = {
+                "task_name": task["task_name"],
+                "url": task["url"],
+                "status": "success",
+                "title": title,
+                "crawled_items": all_items,
+                "total_items": len(all_items),
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+
+            self.logger.info("Saving crawled items")
+            data_storage_service.save_crawl_items(result)
+            self.logger.info(f"Task completed successfully. {len(all_items)} items saved.")
+
+            self.logger.info("Closing context and browser")
+            await context.close()
+            await browser.close()
+            await playwright.stop()
 
         except Exception as e:
             self.logger.error(f"Task execution failed: {str(e)}")
@@ -250,6 +247,6 @@ class TaskWorker:
 if __name__ == "__main__":
     worker = TaskWorker(
         worker_id=str(uuid.uuid4()),  # Generate a unique worker ID
-        orchestrator_url=Config.DOMAIN + "/orchestrator"
+        orchestrator_url=Config.DOMAIN + "orchestrator"
     )
     worker.start()

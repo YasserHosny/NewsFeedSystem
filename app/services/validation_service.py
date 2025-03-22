@@ -31,3 +31,27 @@ def validate_task_fields(task, required_fields):
         if field not in task:
             return False, f"Missing required field: {field}"
     return True, None
+
+def convert_to_minutes(frequency):
+    """
+    Convert frequency to minutes.
+
+    :param frequency: str, frequency in the format '<number> <unit>'
+    :return: int, equivalent frequency in minutes or float('inf') for invalid values
+    """
+    unit_to_minutes = {"mins": 1, "hours": 60, "days": 1440, "weeks": 10080}
+
+    if not isinstance(frequency, str) or " " not in frequency:
+        logger.error(f"Invalid frequency format: {frequency}")
+        return float('inf')  # Invalid format
+
+    value, unit = frequency.split()
+    if unit not in unit_to_minutes:
+        logger.error(f"Invalid frequency unit: {unit}")
+        return float('inf')  # Invalid unit
+
+    try:
+        return int(value) * unit_to_minutes[unit]
+    except ValueError:
+        logger.error(f"Invalid numeric value in frequency: {value}")
+        return float('inf')  # Invalid numeric value

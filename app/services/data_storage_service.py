@@ -1,6 +1,7 @@
 from pymongo import MongoClient
 import os
 import logging
+from datetime import datetime, timezone
 
 # Initialize logging with UTF-8 encoding
 logging.basicConfig(
@@ -25,13 +26,14 @@ class DataStorageService:
         config_collection_name = "config_repo"  # Collection name directly defined in the code
         worker_status_collection_name = "worker_status"  # Collection for worker statuses
         crawl_collection_name = "crawl_repo"  # New collection for crawled items
-
+        task_execution_collection_name = "task_execution_log"  # Collection for task execution logs
         # Initialize MongoDB client
         self.client = MongoClient(mongo_uri)
         self.db = self.client[database_name]
         self.config_collection = self.db[config_collection_name]
         self.worker_status_collection = self.db[worker_status_collection_name]
         self.crawl_collection = self.db[crawl_collection_name]  # Initialize the new collection
+        self.task_execution_collection = self.db[task_execution_collection_name]  # Initialize the new collection
 
     def save_config(self, config):
         """
@@ -62,10 +64,48 @@ class DataStorageService:
         result = self.config_collection.delete_many({})
         return {"deleted_count": result.deleted_count}
     
-    def save_task_result(self, result):
-        """Save task execution result to MongoDB."""
-        self.config_collection.insert_one(result)
-        logger.info("Task result saved to MongoDB: %s", result)
+    def save_task_result(self, task_name, worker_id, proxy, status, error=None):
+        """
+        Save task execution result to the `task_execution_log` collection.
+        
+        :param task_name: Name of the executed task
+        :param worker_id: ID of the worker that executed the task
+        :param proxy: Proxy used during execution
+        :param status: Execution status (success, failed, retrying)
+        :param error: Optional error message if the task failed
+        """
+        task_result = {
+            "task_name": task_name,
+            "worker_id": worker_id,
+            "proxy_used": proxy,
+            "execution_status": status,
+            "error_message": error,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        self.task_execution_collection.insert_one(task_result)
+        logger.info("Task execution result saved to MongoDB: %s", task_result)
+
+    def save_failed_task(self, task_name, worker_id, proxy, error, retry_count):
+        """
+        Save failed task execution in `task_execution_log`.
+
+        :param task_name: Task name
+        :param worker_id: Worker ID
+        :param proxy: Proxy used
+        :param error: Error message
+        :param retry_count: Number of retry attempts
+        """
+        failed_task = {
+            "task_name": task_name,
+            "worker_id": worker_id,
+            "proxy_used": proxy,
+            "status": "failed",
+            "error_message": error,
+            "retry_count": retry_count,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        self.task_execution_collection.insert_one(failed_task)
+        logger.info("Failed task logged: %s", failed_task)
 
     def save_worker_status(self, worker_id, status):
             """
@@ -118,7 +158,7 @@ class DataStorageService:
         :return: str, the current timestamp in ISO format
         """
         from datetime import datetime
-        return datetime.utcnow().isoformat()
+        return datetime.now(timezone.utc).isoformat()
 
     def save_crawl_items(self, result):
         """
