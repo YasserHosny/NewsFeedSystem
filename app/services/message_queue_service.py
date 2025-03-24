@@ -32,7 +32,8 @@ class MessageQueueService:
                 routing_key=self.queue_name,
                 body=json.dumps(task),
                 properties=pika.BasicProperties(
-                    delivery_mode=2  # Make message persistent
+                    delivery_mode=2,  # Make message persistent
+                    message_id=task["task_name"]
                 )
             )
             logger.info("Task published to queue: %s", task)
@@ -64,3 +65,18 @@ class MessageQueueService:
         """Close the RabbitMQ connection."""
         self.connection.close()
         logger.info("Message queue connection closed.")
+
+    def purge_crawl_queue(self):
+        """
+        Purge all messages from the RabbitMQ queue.
+
+        :return: int, the number of messages purged
+        """
+        try:
+            result = self.channel.queue_purge(queue=self.queue_name)
+            logger.warning(f"Purged queue '{self.queue_name}'. Removed {result} messages.")
+            return result
+        except Exception as e:
+            logger.error("Failed to purge queue: %s", str(e))
+            return 0
+

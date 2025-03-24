@@ -11,16 +11,7 @@ class TaskTrackerService:
     Service to track task progress and statuses using MongoDB instead of Redis.
     """
 
-    def update_task_status(self, task_name, status, worker_id=None, proxy=None, last_execution_time=None):
-        """
-        Update task execution status in MongoDB.
-
-        :param task_name: str, name of the task
-        :param status: str, status to set (e.g., scheduled, in-progress, completed, failed)
-        :param worker_id: str or None, worker ID executing the task
-        :param proxy: str or None, proxy used
-        :param last_execution_time: datetime or None, time of execution
-        """
+    def update_task_status(self, task_name, status, worker_id=None, proxy=None, last_execution_time=None, extra_fields=None):
         try:
             update_fields = {
                 "status": status
@@ -31,6 +22,8 @@ class TaskTrackerService:
                 update_fields["proxy"] = proxy
             if last_execution_time is not None:
                 update_fields["last_execution_time"] = last_execution_time
+            if extra_fields:
+                update_fields.update(extra_fields)
 
             result = data_storage_service.config_collection.update_one(
                 {"task_name": task_name},
@@ -44,6 +37,7 @@ class TaskTrackerService:
 
         except Exception as e:
             logger.error(f"Failed to update task status for {task_name}: {str(e)}")
+
 
 
     def get_task_status(self, task_name):

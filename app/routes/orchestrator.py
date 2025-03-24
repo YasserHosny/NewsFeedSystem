@@ -11,10 +11,11 @@ from app.workers.task_worker import TaskWorker
 from app.logging_config import get_logger
 import asyncio
 from threading import Lock
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # Initialize logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
 logger = get_logger('orchestrator')
 
 # Blueprint for Orchestrator API
@@ -24,13 +25,15 @@ orchestrator_bp = Blueprint('orchestrator', __name__)
 message_queue_service = MessageQueueService(queue_name="crawl_tasks")
 proxy_manager = ProxyManagerService()
 task_tracker = TaskTrackerService()
-alert_service = AlertService(webhook_url="https://hooks.slack.com/services/your/webhook/url")
+alert_service = AlertService(
+    webhook_url="https://hooks.slack.com/services/your/webhook/url")
 monitoring_service = MonitoringService()
 
 MAX_RETRIES = 3  # Maximum number of task retries
 # In-memory lock (replace with Redis/Mongo for production)
 task_locks = {}
 task_locks_lock = Lock()
+
 
 def allocate_worker():
     """
@@ -45,6 +48,7 @@ def allocate_worker():
     logger.warning("No available workers.")
     return None
 
+
 def validate_proxy(proxy):
     """
     Validate the assigned proxy to ensure it is functional.
@@ -56,6 +60,7 @@ def validate_proxy(proxy):
     if not is_valid:
         logger.warning(f"Proxy {proxy} validation failed.")
     return is_valid
+
 
 def process_task_with_retry(task):
     """
@@ -69,13 +74,16 @@ def process_task_with_retry(task):
         # Allocate a worker and proxy for the task
         worker_id = allocate_worker()
         if not worker_id:
-            logger.warning("No available workers for task %s. Requeuing task.", task["task_name"])
+            logger.warning(
+                "No available workers for task %s. Requeuing task.", task["task_name"])
             message_queue_service.publish_task(task)
+            monitoring_service.release_worker(worker_id)
             return
 
         proxy = proxy_manager.get_proxy()
         if not proxy:
-            logger.warning("No available proxies for task %s. Requeuing task.", task["task_name"])
+            logger.warning(
+                "No available proxies for task %s. Requeuing task.", task["task_name"])
             message_queue_service.publish_task(task)
             monitoring_service.release_worker(worker_id)
             return
@@ -83,39 +91,51 @@ def process_task_with_retry(task):
         # Update task metadata
         task["allocated_worker"] = worker_id
         task["allocated_proxy"] = proxy
-        logger.info(f"Task {task['task_name']} allocated to worker {worker_id} with proxy {proxy}")
+        logger.info(
+            f"Task {task['task_name']} allocated to worker {worker_id} with proxy {proxy}")
 
-        # Update task status to 'in-progress'
-        task_tracker.update_task_status(task["task_name"], "in-progress", worker_id, proxy)
+        # Update task status to 'assigned'
+        task_tracker.update_task_status(task["task_name"], "assigned", worker_id, proxy,
+                                        extra_fields={"allocated_at": datetime.now(timezone.utc).isoformat()})
 
         # Execute the task
-        logger.info(f"Executing task {task['task_name']} with worker {worker_id} and proxy {proxy}")
-        logger.info(f"worker: {worker_id}, orchestrator_url: {current_app.config['DOMAIN'] + 'orchestrator'}")
+        logger.info(
+            f"Executing task {task['task_name']} with worker {worker_id} and proxy {proxy}")
+        logger.info(
+            f"worker: {worker_id}, orchestrator_url: {current_app.config['DOMAIN'] + 'orchestrator'}")
         worker_instance = TaskWorker(
             worker_id=worker_id,
             orchestrator_url=current_app.config["DOMAIN"] + "orchestrator"
         )
         asyncio.run(worker_instance.execute_task(task))
 
-        # Log success and update task status
-        log_task_result(task, "success")
-        task_tracker.update_task_status(task["task_name"], "completed", worker_id, proxy)
+        logger.info(
+            f"Worker completed task {task['task_name']} — no need to update status from orchestrator.")
+
+        data_storage_service.log_task_execution_status(task["task_name"], task.get(
+            "allocated_worker"), task.get("allocated_proxy"), "success")
         monitoring_service.release_worker(worker_id)
 
     except Exception as e:
         retries += 1
         task["retries"] = retries
-        logger.error(f"Task {task['task_name']} failed on attempt {retries}: {str(e)}")
+        logger.error(
+            f"Task {task['task_name']} failed on attempt {retries}: {str(e)}")
 
         if retries <= MAX_RETRIES:
             # Retry task
-            task_tracker.update_task_status(task["task_name"], f"retrying ({retries}/{MAX_RETRIES})", worker_id, proxy)
+            task_tracker.update_task_status(
+                task["task_name"], f"retrying ({retries}/{MAX_RETRIES})", worker_id, proxy)
             message_queue_service.publish_task(task)
         else:
             # Mark task as failed and send alert
-            log_task_result(task, "failure", error=str(e))
-            task_tracker.update_task_status(task["task_name"], "failed", worker_id, proxy)
-            alert_service.send_alert(f"Task {task['task_name']} failed after {MAX_RETRIES} retries.")
+            data_storage_service.log_task_execution_status(task["task_name"], task.get(
+                "allocated_worker"), task.get("allocated_proxy"), "failure", error=str(e))
+            task_tracker.update_task_status(
+                task["task_name"], "failed", worker_id, proxy)
+            alert_service.send_alert(
+                f"Task {task['task_name']} failed after {MAX_RETRIES} retries.")
+
 
 def log_task_result(task, status, error=None):
     """
@@ -125,7 +145,9 @@ def log_task_result(task, status, error=None):
     :param status: str, task execution status
     :param error: str, error message if the task failed
     """
-    data_storage_service.save_task_result(task["task_name"], task.get("allocated_worker"), task.get("allocated_proxy"), status, error)  # Save result to MongoDB
+    data_storage_service.log_task_execution_status(task["task_name"], task.get(
+        "allocated_worker"), task.get("allocated_proxy"), status, error)
+
 
 @orchestrator_bp.route('/process_tasks', methods=['GET'])
 def process_tasks():
@@ -150,7 +172,8 @@ def process_tasks():
             with task_locks_lock:
                 lock_entry = task_locks.get(task_id)
                 if lock_entry and lock_entry > now:
-                    logger.warning(f"Task {task_id} is already being processed. Skipping.")
+                    logger.warning(
+                        f"Task {task_id} is already being processed. Skipping.")
                     continue
                 # Set lock with 2-minute timeout
                 task_locks[task_id] = now + timedelta(minutes=2)
@@ -159,7 +182,8 @@ def process_tasks():
             try:
                 process_task_with_retry(task)
             except Exception as e:
-                logger.exception(f"Unexpected error during processing task {task_id}: {e}")
+                logger.exception(
+                    f"Unexpected error during processing task {task_id}: {e}")
             finally:
                 # Clean up lock after execution
                 with task_locks_lock:
@@ -171,6 +195,7 @@ def process_tasks():
 
     return jsonify({"status": "stopped", "message": "Task processing stopped."}), 200
 
+
 @orchestrator_bp.route('/failed_tasks', methods=['GET'])
 def get_failed_tasks():
     """
@@ -178,6 +203,7 @@ def get_failed_tasks():
     """
     failed_tasks = data_storage_service.get_all_failed_tasks()
     return jsonify({"status": "success", "failed_tasks": failed_tasks}), 200
+
 
 @orchestrator_bp.route('/workers_status', methods=['GET'])
 def get_workers_status():
@@ -190,6 +216,7 @@ def get_workers_status():
     except Exception as e:
         logger.error(f"Error retrieving worker statuses: {str(e)}")
         return jsonify({"status": "error", "message": "Failed to retrieve worker statuses."}), 500
+
 
 @orchestrator_bp.route('/update_worker_status', methods=['POST'])
 def update_worker_status():

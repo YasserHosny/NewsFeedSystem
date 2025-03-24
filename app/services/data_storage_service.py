@@ -54,6 +54,17 @@ class DataStorageService:
         """
         configs = self.config_collection.find()
         return [{**doc, "_id": str(doc["_id"])} for doc in configs]
+    
+    def get_eligible_configs_for_scheduling(self):
+        """
+        Retrieve configurations that are not already scheduled or in-progress.
+
+        :return: list of dict, eligible tasks for scheduling
+        """
+        configs = self.config_collection.find(
+            {"status": {"$nin": ["scheduled", "in-progress"]}}
+        )
+        return [{**doc, "_id": str(doc["_id"])} for doc in configs]
 
     def clear_storage(self):
         """
@@ -64,7 +75,7 @@ class DataStorageService:
         result = self.config_collection.delete_many({})
         return {"deleted_count": result.deleted_count}
     
-    def save_task_result(self, task_name, worker_id, proxy, status, error=None):
+    def log_task_execution_status(self, task_name, worker_id, proxy, status, error=None):
         """
         Save task execution result to the `task_execution_log` collection.
         
@@ -175,6 +186,19 @@ class DataStorageService:
         
         logger.info("Task execution result saved to MongoDB: %s", result)
         return result
+    
+    def update_task_config(self, task_name, update_fields):
+        """Update fields for a specific task config."""
+        return self.config_collection.update_one(
+            {"task_name": task_name},
+            {"$set": update_fields}
+        )
+
+    def get_task_config_fields(self, task_name, fields=None):
+        """Retrieve selected fields from a task config document."""
+        projection = {field: 1 for field in fields} if fields else None
+        return self.config_collection.find_one({"task_name": task_name}, projection)
+
 
 # Singleton instance of the data storage service
 data_storage_service = DataStorageService()

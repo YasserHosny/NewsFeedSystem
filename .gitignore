@@ -1,2 +1,7 @@
 .venv/
 .codegpt
+logs/
+screenshots/
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
