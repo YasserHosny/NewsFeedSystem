@@ -166,7 +166,7 @@ def process_tasks():
                 continue
 
             task_id = str(task["_id"])
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
 
             # Acquire lock
             with task_locks_lock:

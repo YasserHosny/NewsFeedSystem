@@ -135,7 +135,9 @@ class TaskWorker:
             self.logger.info("Creating new browser context")
             context = await browser.new_context(
                 viewport={'width': 1920, 'height': 1080},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                locale="en-US",
+                java_script_enabled=True
             )
 
             context.set_default_timeout(60000)
@@ -148,6 +150,8 @@ class TaskWorker:
             specific_selector = selectors.get("specific")
             next_page_selector = selectors.get(
                 "next")  # Support for pagination
+            feature_selectors = selectors.get(
+                "features", {})  # New feature selectors
 
             current_url = task["url"]
             page_num = 1
@@ -163,7 +167,7 @@ class TaskWorker:
 
                 self.logger.info(
                     f"Waiting for content selector: {content_selector}")
-                await page.wait_for_selector(content_selector, timeout=10000)
+                await page.wait_for_selector(content_selector, timeout=50000)
                 content_elements = page.locator(content_selector)
                 content_count = await content_elements.count()
 
@@ -172,18 +176,14 @@ class TaskWorker:
 
                 for i in range(content_count):
                     content_element = content_elements.nth(i)
-                    specific_elements = content_element.locator(
-                        specific_selector)
-                    specific_count = await specific_elements.count()
-
-                    for j in range(specific_count):
-                        text = await specific_elements.nth(j).inner_text()
-                        all_items.append({
-                            "page": page_num,
-                            "content_index": i,
-                            "specific_index": j,
-                            "content": text.strip()
-                        })
+                    extracted_items = await self.extract_item_data(
+                        content_element=content_element,
+                        specific_selector=specific_selector,
+                        page_num=page_num,
+                        i=i,
+                        feature_selectors=feature_selectors
+                    )
+                    all_items.extend(extracted_items)
 
                 # Take screenshot of this page
                 screenshot_path = f"{self.screenshot_dir}{task['task_name']}_page{page_num}_{int(time.time())}.png"
@@ -223,7 +223,7 @@ class TaskWorker:
             }
 
             self.logger.info("Saving crawled items")
-            data_storage_service.save_crawl_items(result)
+            data_storage_service.save_updated_items(result)
 
             # Update task status to completed
             task_tracker.update_task_status(
@@ -261,6 +261,78 @@ class TaskWorker:
                 }
             )
             raise
+
+    async def extract_item_data(self, content_element, specific_selector, page_num, i, feature_selectors=None):
+        """
+        Extract data from specific elements within a content block.
+
+        :param content_element: Locator for the content block
+        :param specific_selector: Selector for specific elements within the content block
+        :param page_num: Current page number
+        :param i: Index of the content block
+        :param feature_selectors: Dictionary of feature keys (name) and their corresponding selectors
+        :return: List of extracted items
+        """
+        all_items = []
+        specific_elements = content_element.locator(specific_selector)
+        specific_count = await specific_elements.count()
+
+        for j in range(specific_count):
+            item_data = {
+                "page": page_num,
+                "content_index": i,
+                "specific_index": j
+            }
+
+            async def extract_one_item():
+                element = specific_elements.nth(j)
+
+                if feature_selectors:
+                    for feature_name, selector in feature_selectors.items():
+                        start = time.time()
+                        try:
+                            # 🔄 Normalize selector format
+                            if isinstance(selector, str):
+                                selector = {"selector": selector}
+
+                            raw_selector = selector.get("selector")
+                            if not raw_selector:
+                                raise ValueError(
+                                    f"No selector defined for feature `{feature_name}`")
+
+                            locator = element.locator(raw_selector).first
+
+                            if selector.get("attribute"):
+                                item_data[feature_name] = await locator.get_attribute(
+                                    selector["attribute"], timeout=200
+                                )
+                            else:
+                                # Check if the element is an anchor tag
+                                tag_name = await locator.evaluate("(el) => el.tagName.toLowerCase()")
+                                if tag_name == "a":
+                                    item_data[feature_name] = await locator.get_attribute("href", timeout=200)
+                                else:
+                                    item_data[feature_name] = await locator.inner_text(timeout=200)
+
+                            duration = time.time() - start
+
+                        except Exception as e:
+                            duration = time.time() - start
+                            self.logger.warning(
+                                f"[Item {j}] Feature `{feature_name}` failed after {duration:.2f}s: {e}"
+                            )
+                            item_data[feature_name] = None
+
+            try:
+                # Limit total time per item to 15 seconds
+                await asyncio.wait_for(extract_one_item(), timeout=15)
+            except asyncio.TimeoutError:
+                self.logger.warning(f"[Item {j}] Timeout: skipped after 15s")
+
+            self.logger.info(f"Extracted data for item {j}: {item_data}")
+            all_items.append(item_data)
+
+        return all_items
 
     def worker_process(self):
         """

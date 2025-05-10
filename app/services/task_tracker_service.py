@@ -1,10 +1,13 @@
 import logging
 from app.logging_config import get_logger
-from app.services.data_storage_service import data_storage_service  # Use MongoDB instead of Redis
+# Use MongoDB instead of Redis
+from app.services.data_storage_service import data_storage_service
 
 # Initialize logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s - %(levelname)s - %(message)s")
 logger = get_logger("task_tracker_service")
+
 
 class TaskTrackerService:
     """
@@ -25,31 +28,34 @@ class TaskTrackerService:
             if extra_fields:
                 update_fields.update(extra_fields)
 
-            result = data_storage_service.config_collection.update_one(
-                {"task_name": task_name},
-                {"$set": update_fields}
+            result = data_storage_service.update_task_config(
+                task_name=task_name,
+                update_fields=update_fields
             )
 
             if result.modified_count:
-                logger.info(f"Updated task {task_name} status to {status} with fields: {update_fields}")
+                logger.info(
+                    f"Updated task {task_name} status to {status} with fields: {update_fields}")
             else:
-                logger.warning(f"No documents matched for task {task_name}. Status update skipped.")
+                logger.warning(
+                    f"No documents matched for task {task_name}. Status update skipped.")
 
         except Exception as e:
-            logger.error(f"Failed to update task status for {task_name}: {str(e)}")
-
-
+            logger.error(
+                f"Failed to update task status for {task_name}: {str(e)}")
 
     def get_task_status(self, task_name):
         """
         Get the status of a task from MongoDB.
         """
         try:
-            task = data_storage_service.config_collection.find_one({"task_name": task_name}, {"status": 1})
+            task = data_storage_service.config_collection.find_one(
+                {"task_name": task_name}, {"status": 1})
             if task:
                 return task.get("status", "unknown")
             else:
                 return "not found"
         except Exception as e:
-            logger.error(f"Failed to retrieve task status for {task_name}: {str(e)}")
+            logger.error(
+                f"Failed to retrieve task status for {task_name}: {str(e)}")
             return "error"

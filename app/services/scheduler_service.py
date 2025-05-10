@@ -14,7 +14,7 @@ from app.services.task_tracker_service import TaskTrackerService
 # Initialize Logging
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+logger = logging.getLogger('scheduler_service')
 
 # Initialize Services
 alert_service = AlertService(
@@ -22,7 +22,6 @@ alert_service = AlertService(
 message_queue_service = MessageQueueService(queue_name="crawl_tasks")
 monitoring_service = MonitoringService()
 task_tracker = TaskTrackerService()
-
 
 def start_scheduler(app):
     """
@@ -32,9 +31,6 @@ def start_scheduler(app):
     logger.info("Starting APScheduler for health monitoring tasks...")
 
     scheduler = BackgroundScheduler()
-    # Clear the crawl queue on startup
-    result = message_queue_service.purge_crawl_queue()
-    logger.info(f"Cleared {result} tasks from the crawl queue.")
 
     # Add periodic jobs
     scheduler.add_job(
@@ -88,26 +84,24 @@ def run_in_app_context(app, func):
 def schedule_tasks():
     """ 
     Schedule tasks based on their defined frequency and push only due tasks to the queue.
-    Avoids repetitive DB calls by pre-filtering tasks that are already in 'scheduled' or 'in-progress'.
+    Integrates monitoring to detect delayed executions.
     """
     logger.info("Checking tasks for execution based on frequency...")
 
     try:
-        # Fetch all tasks NOT already in 'scheduled' or 'in-progress' status
-        eligible_tasks_cursor = data_storage_service.get_eligible_configs_for_scheduling()
-
-        tasks = sorted(
-            [{**doc, "_id": str(doc["_id"])} for doc in eligible_tasks_cursor],
-            key=lambda t: convert_to_minutes(t["frequency"])
-        )
-
-        logger.info(f"Number of eligible tasks: {len(tasks)}")
+        # Fetch all scheduled tasks, sorted by frequency for priority execution
+        tasks = sorted(data_storage_service.get_eligible_configs_for_scheduling(),
+                       key=lambda t: convert_to_minutes(t["frequency"]))
+        logger.info(f"Total number of tasks to evaluate: {len(tasks)}")
         current_time = datetime.now(timezone.utc)
+        logger.info(f"Current time: {current_time}")
 
         for task in tasks:
             task_name = task["task_name"]
-            frequency = task.get("frequency", "30 mins")
+            frequency = task.get("frequency", "30 mins")  # Default 30 minutes
             last_execution_time = task.get("last_execution_time")
+            logger.info(f'task.get("last_execution_time"): {last_execution_time}')
+            interval = convert_to_minutes(frequency)
 
             if last_execution_time:
                 if isinstance(last_execution_time, str):
@@ -124,130 +118,57 @@ def schedule_tasks():
                 timedelta(minutes=interval)
 
             logger.info(
-                f"Evaluating task: {task_name}, Frequency: {frequency}, "
-                f"Last Execution: {last_execution_time}, Next Execution: {next_execution_time}"
-            )
+                f"Evaluating task: {task_name}, Frequency: {frequency}, Last Execution: {last_execution_time}, Next Execution: {next_execution_time}")
 
-            # Skip if task is not due
-            if current_time < next_execution_time:
-                logger.info(f"Task {task_name} is not due yet.")
-                continue
+            # Check if the task is due for execution
+            if current_time >= next_execution_time:
+                logger.info(f"Task {task_name} is due for execution. Task status: {task.get('status')}")
 
-            # Check for available workers
-            available_worker = monitoring_service.get_available_worker()
-            if not available_worker:
-                logger.warning(
-                    f"No available workers. Task {task_name} is delayed.")
-                continue
-
-            # Check if task was recently queued, Deduplication by queued_at
-            queued_at = task.get("queued_at")
-            if queued_at:
-                # Handle if queued_at is string (from DB) or datetime (in-memory)
-                if isinstance(queued_at, str):
-                    try:
-                        queued_at = datetime.fromisoformat(queued_at)
-                    except ValueError:
-                        logger.warning(
-                            f"Invalid queued_at format for task {task_name}. Skipping deduplication.")
-                        queued_at = None
-
-            if queued_at and (current_time - queued_at) < timedelta(seconds=30):
-                logger.warning(
-                    f"Task {task_name} was queued recently at {queued_at}. Skipping requeue.")
-                continue
-
-            # Mark as scheduled
-            task_tracker.update_task_status(
-                task_name=task_name,
-                status="scheduled",
-                last_execution_time=current_time.isoformat(),
-                worker_id=None,
-                proxy=None,
-                extra_fields={"queued_at": current_time.isoformat()}
-            )
-
-            # Push to message queue
-            logger.info(
-                f"Pushing task {task_name} to message queue. Task: {task}")
-            message_queue_service.publish_task(task)
-
-            # Notify orchestrator
-            try:
-                response = requests.get(
-                    current_app.config["DOMAIN"] + "/orchestrator/process_tasks", timeout=10
-                )
-                if response.status_code == 200:
-                    logger.info(
-                        f"Task {task_name} successfully dispatched to orchestrator.")
-                    data_storage_service.update_task_config(
-                        task_name,
-                        {"last_orchestrated_at": datetime.now(
-                            timezone.utc).isoformat()}
-                    )
-                else:
+                # Monitor worker availability before scheduling
+                available_worker = monitoring_service.get_available_worker()
+                if not available_worker:
                     logger.warning(
-                        f"Orchestrator responded with status {response.status_code}")
-                    if should_requeue_task(task_name):
+                        f"No available workers. Task {task_name} is delayed.")
+                    continue  # Skip scheduling if no workers are available
+
+                # Push task to the message queue
+                logger.info(f"Pushing task {task_name} to the message queue.")
+                message_queue_service.publish_task(task)
+                task_tracker.update_task_status(task["task_name"], "scheduled")
+
+                # Forward to Orchestrator for worker allocation
+                try:
+                    response = requests.get(
+                        current_app.config["DOMAIN"] + "/orchestrator/process_tasks", timeout=10
+                    )
+                    if response.status_code == 200:
+                        logger.info(
+                            f"Task {task_name} successfully dispatched to orchestrator.")
+                    else:
                         logger.warning(
-                            f"Requeuing task {task_name} due to orchestrator error.")
-                        task_tracker.update_task_status(
-                            task_name=task_name,
-                            status="scheduled",
-                            last_execution_time=current_time,
-                            worker_id=None,
-                            proxy=None,
-                            extra_fields={
-                                "queued_at": datetime.now(timezone.utc).isoformat()}
-                        )
-                        time.sleep(5)
+                            f"Failed to dispatch task {task_name} ({response.status_code}). Requeuing with delay...")
+                        time.sleep(5)  # Avoid flooding the queue
+                        logger.info('Requeuing task... in 5 seconds')
                         message_queue_service.publish_task(task)
-
-            except requests.exceptions.RequestException as e:
-                logger.error(f"Orchestrator unreachable: {str(e)}")
-                if should_requeue_task(task_name):
-                    logger.warning(
-                        f"Requeuing task {task_name} due to orchestrator timeout.")
-                    task_tracker.update_task_status(
-                        task_name=task_name,
-                        status="scheduled",
-                        last_execution_time=current_time,
-                        worker_id=None,
-                        proxy=None,
-                        extra_fields={
-                            "queued_at": datetime.now(timezone.utc).isoformat()}
-                    )
+                except requests.exceptions.RequestException as e:
+                    logger.error(
+                        f"Orchestrator unreachable: {str(e)}. Requeuing with delay...")
                     time.sleep(5)
                     message_queue_service.publish_task(task)
 
+                # Update last execution time efficiently
+                logger.info(
+                    f"Updating last execution time for task {task_name}. last_execution_time: {current_time}")
+                data_storage_service.update_task_config(
+                    task_name,
+                    {"last_execution_time": current_time.isoformat()}
+                )
+            else:
+                logger.info(
+                    f"Task {task_name} is not due yet. Next execution: {next_execution_time}. Task status: {task.get('status')}")
+
     except Exception as e:
         logger.error(f"Error during task scheduling: {str(e)}")
-
-def should_requeue_task(task_name, threshold_seconds=60):
-        """Check task status and queued_at to decide if it should be requeued."""
-        try:
-            task_status = data_storage_service.get_task_config_fields(task_name, fields=["status", "queued_at"])
-            current_status = task_status.get("status")
-            last_queued = task_status.get("queued_at")
-
-            if last_queued and isinstance(last_queued, str):
-                last_queued = datetime.fromisoformat(last_queued)
-
-            already_queued = (
-                last_queued and (
-                    datetime.now(timezone.utc) - last_queued) < timedelta(seconds=threshold_seconds)
-            )
-
-            if current_status in ["in-progress", "assigned", "completed"] or already_queued:
-                logger.warning(
-                    f"Skipping requeue: Task {task_name} is {current_status} or recently queued at {last_queued}.")
-                return False
-            return True
-
-        except Exception as e:
-            logger.error(
-                f"Error during requeue check for task {task_name}: {e}")
-            return False  # Failsafe: better skip than duplicate
 
 
 def enhanced_worker_health_check():

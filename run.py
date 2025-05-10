@@ -10,7 +10,7 @@ logger = get_logger('app')
 app = create_app(config_class=DevelopmentConfig)
 
 # Configure logging for run.py
-get_logger(log_file="run.log")
+get_logger(name="app")
 
 # Start the scheduler for health monitoring
 start_scheduler(app)
