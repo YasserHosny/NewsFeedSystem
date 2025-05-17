@@ -199,19 +199,22 @@ class DataStorageService:
         Save the entire result only if crawled_items contain new or updated entries.
         """
         try:
+            logger.info("Starting save_updated_items process.")
             all_items = result["crawled_items"]
             task_name = result["task_name"]
-            fields_to_compare = result.get(
-                "compare_fields", ["title", "price"])
+            fields_to_compare = result.get("compare_fields", ["title", "price"])
             updated_items = []
+
+            logger.info(f"Processing task: {task_name} with {len(all_items)} items.")
 
             for item in all_items:
                 product_url = item.get("product_url", "")
                 item_id = self.extract_item_id(product_url)
                 if not item_id:
-                    logger.info(
-                        'No item_id found in product_url. Skipping item.')
+                    logger.info("No item_id found in product_url. Skipping item.")
                     continue
+
+                logger.info(f"Checking item with item_id: {item_id}.")
 
                 existing_doc = self.crawl_collection.find_one(
                     {
@@ -227,37 +230,45 @@ class DataStorageService:
 
                 existing = existing_doc.get("crawled_items", [None])[0] if existing_doc else None
 
+                if existing:
+                    logger.info(f"Existing item found for item_id: {item_id}. Comparing fields.")
+                else:
+                    logger.info(f"No existing item found for item_id: {item_id}. Marking as new.")
+
                 # Compare only selected fields
                 if not existing or any(item.get(k) != existing.get(k) for k in fields_to_compare):
-                    # Add update metadata only AFTER confirming it's different
+                    logger.info(f"Item with item_id: {item_id} is new or updated. Adding to updated_items.")
                     item["item_id"] = item_id
                     item["task_name"] = task_name
                     item["last_seen"] = datetime.now(timezone.utc).isoformat()
                     updated_items.append(item)
+                else:
+                    logger.info(f"Item with item_id: {item_id} has no changes. Skipping.")
 
             if updated_items:
+                logger.info(f"Found {len(updated_items)} updated/new items. Preparing to insert into database.")
                 result["crawled_items"] = updated_items
                 result["total_items"] = len(updated_items)
                 result["timestamp"] = datetime.now(timezone.utc).isoformat()
 
                 inserted = self.crawl_collection.insert_one(result)
                 result["_id"] = str(inserted.inserted_id)
-                logger.info(
-                    f"[{task_name}] Inserted {len(updated_items)} new/updated items.")
+                logger.info(f"[{task_name}] Inserted {len(updated_items)} new/updated items into the database.")
                 return result
             else:
-                logger.info(
-                    f"[{task_name}] No updated items detected. Skipped DB insert.")
+                logger.info(f"[{task_name}] No updated items detected. Skipping database insert.")
                 return None
 
         except Exception as e:
-            logger.error(
-                f"Error while saving updated items for task {result.get('task_name', 'UNKNOWN')}: {e}", exc_info=True)
+            logger.error(f"Error while saving updated items for task {result.get('task_name', 'UNKNOWN')}: {e}", exc_info=True)
             return None
 
     def extract_item_id(self, product_url):
-        match = re.search(r"/dp/([A-Z0-9]{10})", product_url)
-        return match.group(1) if match else None
+        # match = re.search(r"(?:/dp/)?([a-zA-Z0-9]+)$", product_url)
+        # return match.group(1) if match else None
+
+        #temp use product_url as item_id
+        return product_url
 
     def update_task_config(self, task_name, update_fields):
         """Update fields for a specific task config."""

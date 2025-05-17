@@ -127,7 +127,8 @@ class TaskWorker:
                     "retry_count": retries
                 }
             )
-            self.logger.info("Starting Playwright")
+            self.logger.info(
+                "Starting Playwright with proxy: %s", task.get("proxy"))
             playwright = await async_playwright().start()
             self.logger.info("Launching browser")
             browser = await playwright.chromium.launch(headless=True)
@@ -159,7 +160,7 @@ class TaskWorker:
             while current_url:
                 self.logger.info(
                     f"Navigating to page {page_num}: {current_url}")
-                response = await page.goto(current_url, wait_until='domcontentloaded', timeout=60000)
+                response = await page.goto(current_url, wait_until='load', timeout=60000)
 
                 if not response or response.status >= 400:
                     raise Exception(
@@ -167,7 +168,10 @@ class TaskWorker:
 
                 self.logger.info(
                     f"Waiting for content selector: {content_selector}")
-                await page.wait_for_selector(content_selector, timeout=50000)
+                await page.wait_for_selector(content_selector, timeout=500000)
+                # ⬇️ scroll down to trigger rendering
+                await page.evaluate("window.scrollBy(0, 300)")
+                await page.wait_for_timeout(5000)
                 content_elements = page.locator(content_selector)
                 content_count = await content_elements.count()
 
@@ -276,6 +280,8 @@ class TaskWorker:
         all_items = []
         specific_elements = content_element.locator(specific_selector)
         specific_count = await specific_elements.count()
+        self.logger.info(
+            f"Found {specific_count} specific elements in content block {i} on page {page_num}")
 
         for j in range(specific_count):
             item_data = {
@@ -286,48 +292,62 @@ class TaskWorker:
 
             async def extract_one_item():
                 element = specific_elements.nth(j)
+                self.logger.info(f"Extracting features for item {j} in content block {i} on page {page_num}")
 
                 if feature_selectors:
                     for feature_name, selector in feature_selectors.items():
                         start = time.time()
+                        self.logger.debug(f"[Item {j}] Starting extraction for feature `{feature_name}` with selector: {selector}")
+
                         try:
-                            # 🔄 Normalize selector format
+                            # 🔄 Normalize flat string selector to dict format
                             if isinstance(selector, str):
+                                self.logger.debug(f"[Item {j}] Feature `{feature_name}` selector is a string, converting to dict.")
                                 selector = {"selector": selector}
 
                             raw_selector = selector.get("selector")
-                            if not raw_selector:
-                                raise ValueError(
-                                    f"No selector defined for feature `{feature_name}`")
+                            attribute = selector.get("attribute")
 
+                            if not raw_selector:
+                                self.logger.error(f"[Item {j}] No selector defined for feature `{feature_name}`")
+                                raise ValueError(f"No selector defined for feature `{feature_name}`")
+
+                            self.logger.debug(f"[Item {j}] Locating element for feature `{feature_name}` using selector: {raw_selector}")
                             locator = element.locator(raw_selector).first
 
-                            if selector.get("attribute"):
-                                item_data[feature_name] = await locator.get_attribute(
-                                    selector["attribute"], timeout=200
-                                )
+                            # Ensure element is visible/rendered
+                            self.logger.debug(f"[Item {j}] Scrolling into view for feature `{feature_name}`")
+                            await locator.scroll_into_view_if_needed(timeout=300)
+
+                            value = None
+
+                            if attribute:
+                                self.logger.debug(f"[Item {j}] Getting attribute `{attribute}` for `{feature_name}`")
+                                value = await locator.evaluate(f"el => el.getAttribute('{attribute}')", timeout=300)
+                                self.logger.debug(f"[Item {j}] Attribute `{attribute}` value for `{feature_name}`: {value}")
                             else:
-                                # Check if the element is an anchor tag
-                                tag_name = await locator.evaluate("(el) => el.tagName.toLowerCase()")
-                                if tag_name == "a":
-                                    item_data[feature_name] = await locator.get_attribute("href", timeout=200)
-                                else:
-                                    item_data[feature_name] = await locator.inner_text(timeout=200)
+                                self.logger.debug(f"[Item {j}] Getting text content for `{feature_name}`")
+                                value = await locator.text_content(timeout=300)
+                                self.logger.debug(f"[Item {j}] Text content for `{feature_name}`: {value}")
+
+                            item_data[feature_name] = value
 
                             duration = time.time() - start
+                            self.logger.info(f"[Item {j}] Feature `{feature_name}` extracted in {duration:.2f}s")
 
                         except Exception as e:
                             duration = time.time() - start
                             self.logger.warning(
                                 f"[Item {j}] Feature `{feature_name}` failed after {duration:.2f}s: {e}"
                             )
+                            self.logger.debug(f"[Item {j}] Exception details for feature `{feature_name}`: {repr(e)}")
                             item_data[feature_name] = None
 
             try:
                 # Limit total time per item to 15 seconds
-                await asyncio.wait_for(extract_one_item(), timeout=15)
+                await asyncio.wait_for(extract_one_item(), timeout=30)
             except asyncio.TimeoutError:
-                self.logger.warning(f"[Item {j}] Timeout: skipped after 15s")
+                self.logger.warning(f"[Item {j}] Timeout: skipped after 30s")
 
             self.logger.info(f"Extracted data for item {j}: {item_data}")
             all_items.append(item_data)

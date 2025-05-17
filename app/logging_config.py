@@ -38,7 +38,8 @@ def configure_logging():
         "monitoring_service",
         "alert_service",
         "data_storage_service",
-        "message_queue_service"
+        "message_queue_service",
+        "integration_test"
     ]:
         logger = logging.getLogger(name)
         logger.setLevel(getattr(logging, log_level, logging.INFO))
